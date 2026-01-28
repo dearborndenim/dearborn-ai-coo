@@ -1022,6 +1022,47 @@ async def test_event():
     return {"success": True, "event_id": event_id}
 
 
+@app.post("/coo/events/test-low", tags=["Events"])
+async def test_low_alert(db: Session = Depends(get_db_session)):
+    """Test inventory low alert flow to CMO."""
+    # Find a low stock item
+    low_stock_item = db.query(FinishedGoodsInventory).filter(
+        FinishedGoodsInventory.is_low_stock == True,
+        FinishedGoodsInventory.quantity_on_hand > 0
+    ).first()
+
+    if low_stock_item:
+        item_name = f"{low_stock_item.product_title} - {low_stock_item.variant_title}"
+        sku = low_stock_item.sku
+        quantity = low_stock_item.quantity_on_hand
+        item_id = low_stock_item.id
+        reorder_point = low_stock_item.reorder_point
+    else:
+        item_name = "Test Product"
+        sku = "TEST-SKU"
+        quantity = 5
+        item_id = 0
+        reorder_point = 10
+
+    event_id = publish_inventory_low(
+        item_type="sub_assembly",
+        item_id=item_id,
+        item_name=item_name,
+        current_quantity=quantity,
+        reorder_point=reorder_point,
+        sku=sku
+    )
+
+    return {
+        "success": True,
+        "event_id": event_id,
+        "target": "cmo",
+        "item": item_name,
+        "quantity": quantity,
+        "message": "Inventory low event sent to CMO"
+    }
+
+
 @app.post("/coo/events/test-critical", tags=["Events"])
 async def test_critical_alert(db: Session = Depends(get_db_session)):
     """Test inventory critical alert flow to CEO."""

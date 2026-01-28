@@ -106,28 +106,39 @@ class EventBus:
             except Exception as e:
                 print(f"Failed to publish to Redis: {e}")
 
-        # HTTP fallback to CEO
-        ceo_api_url = settings.ceo_api_url
-        if ceo_api_url and target_module == "ceo":
-            try:
-                import httpx
+        # HTTP fallback for modules that can't run Redis listeners
+        try:
+            import httpx
+
+            # CEO fallback
+            if target_module == "ceo" and settings.ceo_api_url:
                 response = httpx.post(
-                    f"{ceo_api_url}/ceo/approvals",
+                    f"{settings.ceo_api_url}/ceo/approvals",
                     json={
                         "requesting_module": "coo",
-                        "request_type": event_type.value,
-                        "title": payload.get("title", f"COO: {event_type.value}"),
+                        "request_type": event_type.value if isinstance(event_type, COOOutboundEvent) else event_type,
+                        "title": payload.get("title", f"COO: {event_type}"),
                         "description": payload.get("message", ""),
                         "payload": payload,
-                        "risk_level": "medium" if "critical" in event_type.value.lower() else "low"
+                        "risk_level": "medium" if "critical" in str(event_type).lower() else "low"
                     },
                     timeout=10.0
                 )
                 if response.status_code == 200:
-                    print(f"Published event {event_type} via HTTP fallback")
-                    return event_id
-            except Exception as e:
-                print(f"Failed to publish via HTTP fallback: {e}")
+                    print(f"Published event {event_type} to CEO via HTTP fallback")
+
+            # CMO fallback (serverless - can't run Redis listener)
+            if target_module == "cmo" and settings.cmo_api_url:
+                response = httpx.post(
+                    f"{settings.cmo_api_url}/api/events/webhook",
+                    json=event,
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    print(f"Published event {event_type} to CMO via HTTP webhook")
+
+        except Exception as e:
+            print(f"Failed to publish via HTTP fallback: {e}")
 
         return event_id
 
