@@ -292,6 +292,24 @@ class FinishedGoodsInventory(Base):
 
 
 # ============================================================================
+# SHOPIFY AUTH
+# ============================================================================
+
+class ShopifyAuth(Base):
+    """Stored Shopify OAuth tokens."""
+    __tablename__ = "shopify_auth"
+
+    id = Column(Integer, primary_key=True, index=True)
+    store = Column(String(255), unique=True, nullable=False)
+    access_token = Column(String(500), nullable=False)
+    scope = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = ({'schema': COO_SCHEMA},)
+
+
+# ============================================================================
 # ALERTS AND EVENTS
 # ============================================================================
 

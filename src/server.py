@@ -20,7 +20,8 @@ from .db import (
     init_db, get_db_session, SessionLocal,
     RawMaterial, MaterialType, MaterialTransaction,
     Supplier, ProductionRun, ProductionStage, ProductionStageLog,
-    FinishedGoodsInventory, COOAlert, AlertSeverity, COOEvent
+    FinishedGoodsInventory, COOAlert, AlertSeverity, COOEvent,
+    ShopifyAuth
 )
 from .event_bus import (
     event_bus, publish_inventory_low, publish_inventory_critical,
@@ -193,6 +194,118 @@ async def detailed_health_check(db: Session = Depends(get_db_session)):
         "database": db_status,
         "redis": "connected" if event_bus.is_connected() else "disconnected",
         "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+# ============================================================================
+# SHOPIFY AUTH ENDPOINTS
+# ============================================================================
+
+SHOPIFY_SCOPES = ["read_products", "read_inventory"]
+
+
+def get_shopify_token(db: Session) -> Optional[str]:
+    """Get stored Shopify access token."""
+    auth = db.query(ShopifyAuth).filter(ShopifyAuth.store == settings.shopify_store).first()
+    if auth:
+        return auth.access_token
+    # Fallback to env var if set
+    return settings.shopify_access_token if settings.shopify_access_token else None
+
+
+@app.get("/coo/auth/shopify", tags=["Auth"])
+async def shopify_auth_start(request: Request):
+    """Start Shopify OAuth flow."""
+    if not settings.shopify_client_id:
+        raise HTTPException(status_code=503, detail="Shopify client ID not configured")
+
+    # Generate state for CSRF protection
+    import secrets
+    state = secrets.token_urlsafe(32)
+
+    # Build redirect URI from request
+    redirect_uri = str(request.url).replace("/coo/auth/shopify", "/coo/auth/shopify/callback")
+    if "localhost" not in redirect_uri:
+        redirect_uri = redirect_uri.replace("http://", "https://")
+
+    params = {
+        "client_id": settings.shopify_client_id,
+        "scope": ",".join(SHOPIFY_SCOPES),
+        "redirect_uri": redirect_uri,
+        "state": state
+    }
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    auth_url = f"https://{settings.shopify_store}/admin/oauth/authorize?{query}"
+
+    return {"auth_url": auth_url, "state": state}
+
+
+@app.get("/coo/auth/shopify/callback", tags=["Auth"])
+async def shopify_auth_callback(
+    code: str = Query(...),
+    state: str = Query(None),
+    db: Session = Depends(get_db_session)
+):
+    """Handle Shopify OAuth callback."""
+    if not settings.shopify_client_id or not settings.shopify_client_secret:
+        raise HTTPException(status_code=503, detail="Shopify credentials not configured")
+
+    try:
+        import httpx
+
+        # Exchange code for access token
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://{settings.shopify_store}/admin/oauth/access_token",
+                json={
+                    "client_id": settings.shopify_client_id,
+                    "client_secret": settings.shopify_client_secret,
+                    "code": code
+                },
+                timeout=30.0
+            )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Token exchange failed: {response.text}")
+
+        token_data = response.json()
+        access_token = token_data.get("access_token")
+        scope = token_data.get("scope", "")
+
+        # Store token in database
+        existing = db.query(ShopifyAuth).filter(ShopifyAuth.store == settings.shopify_store).first()
+        if existing:
+            existing.access_token = access_token
+            existing.scope = scope
+            existing.updated_at = datetime.utcnow()
+        else:
+            new_auth = ShopifyAuth(
+                store=settings.shopify_store,
+                access_token=access_token,
+                scope=scope
+            )
+            db.add(new_auth)
+
+        db.commit()
+
+        return {
+            "success": True,
+            "message": "Shopify connected successfully",
+            "scope": scope
+        }
+
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=500, detail=f"Request failed: {str(e)}")
+
+
+@app.get("/coo/auth/shopify/status", tags=["Auth"])
+async def shopify_auth_status(db: Session = Depends(get_db_session)):
+    """Check Shopify authentication status."""
+    token = get_shopify_token(db)
+    return {
+        "connected": token is not None,
+        "store": settings.shopify_store,
+        "has_client_id": bool(settings.shopify_client_id)
     }
 
 
@@ -602,8 +715,12 @@ async def list_finished_goods(
 @app.post("/coo/finished-goods/sync", tags=["Finished Goods"])
 async def sync_finished_goods_from_shopify(db: Session = Depends(get_db_session)):
     """Sync finished goods inventory from Shopify."""
-    if not settings.shopify_access_token:
-        raise HTTPException(status_code=503, detail="Shopify not configured")
+    access_token = get_shopify_token(db)
+    if not access_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Shopify not connected. Visit /coo/auth/shopify to authenticate."
+        )
 
     try:
         import httpx
@@ -637,9 +754,9 @@ async def sync_finished_goods_from_shopify(db: Session = Depends(get_db_session)
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"https://{settings.shopify_store}/admin/api/2024-01/graphql.json",
+                f"https://{settings.shopify_store}/admin/api/2026-01/graphql.json",
                 headers={
-                    "X-Shopify-Access-Token": settings.shopify_access_token,
+                    "X-Shopify-Access-Token": access_token,
                     "Content-Type": "application/json"
                 },
                 json={"query": query},

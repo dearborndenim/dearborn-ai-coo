@@ -20,7 +20,9 @@ class Settings(BaseSettings):
 
     # Shopify API (for inventory sync)
     shopify_store: str = os.getenv("SHOPIFY_STORE", "dearborndenim.myshopify.com")
-    shopify_access_token: str = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
+    shopify_client_id: str = os.getenv("SHOPIFY_CLIENT_ID", "")
+    shopify_client_secret: str = os.getenv("SHOPIFY_CLIENT_SECRET", "")
+    shopify_access_token: str = os.getenv("SHOPIFY_ACCESS_TOKEN", "")  # Stored after OAuth
 
     # Other module URLs for HTTP fallback
     ceo_api_url: str = os.getenv("CEO_API_URL", "")
