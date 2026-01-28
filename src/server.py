@@ -1022,6 +1022,42 @@ async def test_event():
     return {"success": True, "event_id": event_id}
 
 
+@app.post("/coo/events/test-critical", tags=["Events"])
+async def test_critical_alert(db: Session = Depends(get_db_session)):
+    """Test inventory critical alert flow to CEO."""
+    # Find a low stock item to use as example
+    low_stock_item = db.query(FinishedGoodsInventory).filter(
+        FinishedGoodsInventory.quantity_on_hand <= 0
+    ).first()
+
+    if low_stock_item:
+        item_name = f"{low_stock_item.product_title} - {low_stock_item.variant_title}"
+        sku = low_stock_item.sku
+        quantity = low_stock_item.quantity_on_hand
+        item_id = low_stock_item.id
+    else:
+        item_name = "Test Product"
+        sku = "TEST-SKU"
+        quantity = -5
+        item_id = 0
+
+    event_id = publish_inventory_critical(
+        item_type="sub_assembly",
+        item_id=item_id,
+        item_name=item_name,
+        current_quantity=quantity,
+        sku=sku
+    )
+
+    return {
+        "success": True,
+        "event_id": event_id,
+        "item": item_name,
+        "quantity": quantity,
+        "message": "Inventory critical event sent to CEO"
+    }
+
+
 # ============================================================================
 # DASHBOARD ENDPOINT
 # ============================================================================
