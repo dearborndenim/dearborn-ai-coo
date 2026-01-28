@@ -713,8 +713,16 @@ async def list_finished_goods(
 
 
 @app.post("/coo/finished-goods/sync", tags=["Finished Goods"])
-async def sync_finished_goods_from_shopify(db: Session = Depends(get_db_session)):
-    """Sync finished goods inventory from Shopify."""
+async def sync_finished_goods_from_shopify(
+    clear_old: bool = Query(default=False, description="Clear non-tagged products from database"),
+    db: Session = Depends(get_db_session)
+):
+    """
+    Sync sub-assembly inventory from Shopify.
+
+    Only syncs products with 'trackOutOfStockReport' tag - these are the real
+    sub-assembly inventory items, not the virtual finished goods.
+    """
     access_token = get_shopify_token(db)
     if not access_token:
         raise HTTPException(
@@ -725,14 +733,20 @@ async def sync_finished_goods_from_shopify(db: Session = Depends(get_db_session)
     try:
         import httpx
 
-        # Fetch inventory from Shopify GraphQL API
-        query = """
-        {
-            products(first: 250) {
+        # GraphQL query to fetch ONLY products with trackOutOfStockReport tag
+        # Using pagination to handle large catalogs
+        query_template = """
+        query ($cursor: String) {
+            products(first: 250, after: $cursor, query: "tag:trackOutOfStockReport") {
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
                 edges {
                     node {
                         id
                         title
+                        tags
                         variants(first: 100) {
                             edges {
                                 node {
@@ -752,84 +766,116 @@ async def sync_finished_goods_from_shopify(db: Session = Depends(get_db_session)
         }
         """
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"https://{settings.shopify_store}/admin/api/2026-01/graphql.json",
-                headers={
-                    "X-Shopify-Access-Token": access_token,
-                    "Content-Type": "application/json"
-                },
-                json={"query": query},
-                timeout=30.0
-            )
-
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Shopify API error: {response.status_code}")
-
-        data = response.json()
-        products = data.get("data", {}).get("products", {}).get("edges", [])
-
         synced_count = 0
-        for product_edge in products:
-            product = product_edge["node"]
-            product_id = product["id"].split("/")[-1]
-            product_title = product["title"]
+        synced_variant_ids = set()
+        cursor = None
+        has_next_page = True
 
-            for variant_edge in product.get("variants", {}).get("edges", []):
-                variant = variant_edge["node"]
-                variant_id = variant["id"].split("/")[-1]
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            while has_next_page:
+                response = await client.post(
+                    f"https://{settings.shopify_store}/admin/api/2026-01/graphql.json",
+                    headers={
+                        "X-Shopify-Access-Token": access_token,
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "query": query_template,
+                        "variables": {"cursor": cursor}
+                    }
+                )
 
-                # Upsert inventory record
-                existing = db.query(FinishedGoodsInventory).filter(
-                    FinishedGoodsInventory.shopify_variant_id == variant_id
-                ).first()
+                if response.status_code != 200:
+                    raise HTTPException(status_code=500, detail=f"Shopify API error: {response.status_code}")
 
-                quantity = variant.get("inventoryQuantity", 0)
-                reorder_point = existing.reorder_point if existing else settings.default_reorder_point
+                data = response.json()
 
-                if existing:
-                    old_quantity = existing.quantity_on_hand
-                    existing.product_title = product_title
-                    existing.variant_title = variant.get("title")
-                    existing.sku = variant.get("sku")
-                    existing.quantity_on_hand = quantity
-                    existing.quantity_available = quantity  # Simplified
-                    existing.is_low_stock = quantity <= reorder_point
-                    existing.last_synced_at = datetime.utcnow()
+                # Check for GraphQL errors
+                if "errors" in data:
+                    raise HTTPException(status_code=500, detail=f"GraphQL error: {data['errors']}")
 
-                    # Check for low stock transition
-                    if quantity <= reorder_point and old_quantity > reorder_point:
-                        publish_inventory_low(
-                            item_type="finished_goods",
-                            item_id=existing.id,
-                            item_name=f"{product_title} - {variant.get('title', '')}",
-                            current_quantity=quantity,
-                            reorder_point=reorder_point,
-                            sku=variant.get("sku")
-                        )
-                else:
-                    new_item = FinishedGoodsInventory(
-                        shopify_product_id=product_id,
-                        shopify_variant_id=variant_id,
-                        shopify_inventory_item_id=variant.get("inventoryItem", {}).get("id", "").split("/")[-1] if variant.get("inventoryItem") else None,
-                        product_title=product_title,
-                        variant_title=variant.get("title"),
-                        sku=variant.get("sku"),
-                        quantity_on_hand=quantity,
-                        quantity_available=quantity,
-                        reorder_point=reorder_point,
-                        is_low_stock=quantity <= reorder_point,
-                        last_synced_at=datetime.utcnow()
-                    )
-                    db.add(new_item)
+                products_data = data.get("data", {}).get("products", {})
+                products = products_data.get("edges", [])
+                page_info = products_data.get("pageInfo", {})
 
-                synced_count += 1
+                for product_edge in products:
+                    product = product_edge["node"]
+                    product_id = product["id"].split("/")[-1]
+                    product_title = product["title"]
+
+                    for variant_edge in product.get("variants", {}).get("edges", []):
+                        variant = variant_edge["node"]
+                        variant_id = variant["id"].split("/")[-1]
+                        synced_variant_ids.add(variant_id)
+
+                        # Upsert inventory record
+                        existing = db.query(FinishedGoodsInventory).filter(
+                            FinishedGoodsInventory.shopify_variant_id == variant_id
+                        ).first()
+
+                        quantity = variant.get("inventoryQuantity", 0)
+                        reorder_point = existing.reorder_point if existing else settings.default_reorder_point
+
+                        if existing:
+                            old_quantity = existing.quantity_on_hand
+                            existing.product_title = product_title
+                            existing.variant_title = variant.get("title")
+                            existing.sku = variant.get("sku")
+                            existing.quantity_on_hand = quantity
+                            existing.quantity_available = quantity
+                            existing.is_low_stock = quantity <= reorder_point
+                            existing.last_synced_at = datetime.utcnow()
+
+                            # Check for low stock transition
+                            if quantity <= reorder_point and old_quantity > reorder_point:
+                                publish_inventory_low(
+                                    item_type="sub_assembly",
+                                    item_id=existing.id,
+                                    item_name=f"{product_title} - {variant.get('title', '')}",
+                                    current_quantity=quantity,
+                                    reorder_point=reorder_point,
+                                    sku=variant.get("sku")
+                                )
+                        else:
+                            new_item = FinishedGoodsInventory(
+                                shopify_product_id=product_id,
+                                shopify_variant_id=variant_id,
+                                shopify_inventory_item_id=variant.get("inventoryItem", {}).get("id", "").split("/")[-1] if variant.get("inventoryItem") else None,
+                                product_title=product_title,
+                                variant_title=variant.get("title"),
+                                sku=variant.get("sku"),
+                                quantity_on_hand=quantity,
+                                quantity_available=quantity,
+                                reorder_point=reorder_point,
+                                is_low_stock=quantity <= reorder_point,
+                                last_synced_at=datetime.utcnow()
+                            )
+                            db.add(new_item)
+
+                        synced_count += 1
+
+                # Check for more pages
+                has_next_page = page_info.get("hasNextPage", False)
+                cursor = page_info.get("endCursor")
+
+        # Optionally clear products that no longer have the tag
+        cleared_count = 0
+        if clear_old:
+            # Delete records not in this sync (they don't have the tag anymore)
+            old_records = db.query(FinishedGoodsInventory).filter(
+                ~FinishedGoodsInventory.shopify_variant_id.in_(synced_variant_ids)
+            ).all()
+            cleared_count = len(old_records)
+            for record in old_records:
+                db.delete(record)
 
         db.commit()
 
         return {
             "success": True,
             "synced_count": synced_count,
+            "cleared_count": cleared_count,
+            "filter": "tag:trackOutOfStockReport",
             "synced_at": datetime.utcnow().isoformat()
         }
 
