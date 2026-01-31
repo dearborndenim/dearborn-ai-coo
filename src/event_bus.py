@@ -104,16 +104,19 @@ class EventBus:
         self._log_event_to_db(event, direction="outbound")
 
         # Try Redis
+        redis_delivered = False
         if self.client:
             try:
                 channel = f"dearborn:events:{target_module}" if target_module else "dearborn:events:broadcast"
-                self.client.publish(channel, json.dumps(event))
-                print(f"Published event {event_type} to {channel}")
-                return event_id
+                receivers = self.client.publish(channel, json.dumps(event))
+                print(f"Published event {event_type} to {channel} ({receivers} receivers)")
+                if receivers > 0:
+                    return event_id
+                redis_delivered = False
             except Exception as e:
                 print(f"Failed to publish to Redis: {e}")
 
-        # HTTP fallback for modules that can't run Redis listeners
+        # HTTP fallback when Redis has no subscribers or is unavailable
         try:
             import httpx
 
