@@ -54,9 +54,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Database init failed: {e}")
 
-    # Check event bus
+    # Check event bus and start listener
     if event_bus.is_connected():
         logger.info("Event bus connected to Redis")
+        event_bus.start_listener()
+        logger.info("Event bus listener started")
     else:
         logger.warning("Event bus not connected (HTTP fallback enabled)")
 
@@ -87,9 +89,16 @@ app = FastAPI(
 )
 
 # CORS
+def _get_allowed_origins():
+    env = os.getenv("ALLOWED_ORIGINS", "")
+    if env:
+        return [o.strip() for o in env.split(",")]
+    return []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_get_allowed_origins(),
+    allow_origin_regex=r"https://.*\.up\.railway\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     # Other module URLs for HTTP fallback
     ceo_api_url: str = os.getenv("CEO_API_URL", "")
     cfo_api_url: str = os.getenv("CFO_API_URL", "")
+    cdo_api_url: str = os.getenv("CDO_API_URL", "")
     cmo_api_url: str = os.getenv("CMO_API_URL", "")
 
     # Inventory thresholds

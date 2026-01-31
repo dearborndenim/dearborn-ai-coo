@@ -7,6 +7,7 @@ Publishes inventory alerts and receives events from other modules.
 
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Optional, Dict, Any
 from enum import Enum
@@ -29,12 +30,18 @@ class COOOutboundEvent(str, Enum):
     MATERIAL_REORDER_NEEDED = "material_reorder_needed"
 
 
+class COOOutboundEvent2(str, Enum):
+    """Additional outbound events"""
+    INVENTORY_COST_UPDATE = "inventory_cost_update"
+
+
 class COOInboundEvent(str, Enum):
     """Events the COO module listens for"""
     APPROVAL_DECIDED = "approval_decided"
     CAMPAIGN_PLANNED = "campaign_planned"
     PRIORITY_CHANGED = "priority_changed"
     BUDGET_ALLOCATED = "budget_allocated"
+    CAPACITY_CHECK_REQUEST = "capacity_check_request"
 
 
 class EventBus:
@@ -137,6 +144,26 @@ class EventBus:
                 if response.status_code == 200:
                     print(f"Published event {event_type} to CMO via HTTP webhook")
 
+            # CFO fallback
+            if target_module == "cfo" and settings.cfo_api_url:
+                response = httpx.post(
+                    f"{settings.cfo_api_url}/cfo/events/receive",
+                    json=event,
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    print(f"Published event {event_type} to CFO via HTTP fallback")
+
+            # CDO fallback
+            if target_module == "cdo" and settings.cdo_api_url:
+                response = httpx.post(
+                    f"{settings.cdo_api_url}/cdo/events/webhook",
+                    json=event,
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    print(f"Published event {event_type} to CDO via HTTP fallback")
+
         except Exception as e:
             print(f"Failed to publish via HTTP fallback: {e}")
 
@@ -176,6 +203,10 @@ class EventBus:
                 self._handle_campaign_planned(payload)
             elif event_type == COOInboundEvent.PRIORITY_CHANGED.value:
                 self._handle_priority_changed(payload)
+            elif event_type == COOInboundEvent.BUDGET_ALLOCATED.value:
+                self._handle_budget_allocated(payload)
+            elif event_type == COOInboundEvent.CAPACITY_CHECK_REQUEST.value:
+                self._handle_capacity_check_request(payload)
             else:
                 print(f"Unknown event type: {event_type}")
         except Exception as e:
@@ -205,8 +236,42 @@ class EventBus:
     def _handle_campaign_planned(self, payload: Dict[str, Any]):
         """Handle campaign planned from CMO - check if we have inventory."""
         product_ids = payload.get("product_ids", [])
-        # TODO: Check inventory for these products and alert if low
         print(f"CMO planning campaign for products: {product_ids}")
+
+        if not product_ids:
+            return
+
+        db = SessionLocal()
+        try:
+            from .db import FinishedGoodsInventory
+            low_items = []
+            for pid in product_ids:
+                items = db.query(FinishedGoodsInventory).filter(
+                    FinishedGoodsInventory.shopify_product_id == str(pid),
+                    FinishedGoodsInventory.is_low_stock == True
+                ).all()
+                for item in items:
+                    low_items.append(item)
+                    publish_inventory_low(
+                        item_type="finished_goods",
+                        item_id=item.id,
+                        item_name=f"{item.product_title} - {item.variant_title}",
+                        current_quantity=item.quantity_on_hand,
+                        reorder_point=item.reorder_point,
+                        sku=item.sku
+                    )
+
+            if low_items:
+                alert = COOAlert(
+                    severity=AlertSeverity.WARNING,
+                    category="inventory",
+                    title="Campaign Stock Warning",
+                    message=f"CMO campaign targets {len(product_ids)} products; {len(low_items)} variants are low stock"
+                )
+                db.add(alert)
+                db.commit()
+        finally:
+            db.close()
 
     def _handle_priority_changed(self, payload: Dict[str, Any]):
         """Handle priority change from CEO."""
@@ -222,6 +287,98 @@ class EventBus:
             db.commit()
         finally:
             db.close()
+
+    def _handle_budget_allocated(self, payload: Dict[str, Any]):
+        """Handle budget allocation from CEO."""
+        module = payload.get("module")
+        amount = payload.get("amount", 0)
+        category = payload.get("category", "general")
+
+        if module and module != "coo":
+            return
+
+        db = SessionLocal()
+        try:
+            alert = COOAlert(
+                severity=AlertSeverity.INFO,
+                category="budget",
+                title="Budget Allocated",
+                message=f"${amount:,.2f} allocated for {category}"
+            )
+            db.add(alert)
+            db.commit()
+        finally:
+            db.close()
+
+    def _handle_capacity_check_request(self, payload: Dict[str, Any]):
+        """Handle capacity check request from CDO for new product concepts."""
+        validation_request_id = payload.get("validation_request_id")
+        quantity_needed = payload.get("quantity_needed", 0)
+
+        db = SessionLocal()
+        try:
+            from .db import ProductionRun
+            active_runs = db.query(ProductionRun).filter(
+                ProductionRun.status == "in_progress"
+            ).count()
+            planned_runs = db.query(ProductionRun).filter(
+                ProductionRun.status == "planned"
+            ).count()
+
+            max_concurrent = 5
+            has_capacity = (active_runs + planned_runs) < max_concurrent
+            available_slots = max(0, max_concurrent - active_runs - planned_runs)
+
+            self.publish(
+                "capacity_check_response",
+                {
+                    "validation_request_id": validation_request_id,
+                    "approved": has_capacity,
+                    "active_runs": active_runs,
+                    "planned_runs": planned_runs,
+                    "available_slots": available_slots,
+                    "summary": f"Capacity {'available' if has_capacity else 'full'}: {active_runs} active, {planned_runs} planned, {available_slots} slots open"
+                },
+                target_module="cdo"
+            )
+
+            alert = COOAlert(
+                severity=AlertSeverity.INFO if has_capacity else AlertSeverity.WARNING,
+                category="capacity",
+                title=f"Capacity Check: {'Available' if has_capacity else 'Full'}",
+                message=f"CDO requested capacity for validation {validation_request_id}. {active_runs} active, {planned_runs} planned runs."
+            )
+            db.add(alert)
+            db.commit()
+        except Exception as e:
+            print(f"Error handling capacity check: {e}")
+        finally:
+            db.close()
+
+    def start_listener(self):
+        """Start background Redis listener thread for incoming events."""
+        if not self.client:
+            print("Redis not connected - COO listener not started")
+            return
+
+        def _listen():
+            try:
+                pubsub = self.client.pubsub()
+                pubsub.subscribe("dearborn:events:coo", "dearborn:events:broadcast")
+                print("COO Redis listener started on dearborn:events:coo + broadcast")
+                for message in pubsub.listen():
+                    if message["type"] == "message":
+                        try:
+                            event = json.loads(message["data"])
+                            if event.get("source_module") != "coo":
+                                self.handle_incoming_event(event)
+                        except Exception as e:
+                            print(f"COO listener error: {e}")
+            except Exception as e:
+                print(f"COO Redis listener failed: {e}")
+
+        thread = threading.Thread(target=_listen, daemon=True)
+        thread.start()
 
     def disconnect(self):
         """Disconnect from Redis."""
