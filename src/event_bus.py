@@ -33,6 +33,8 @@ class COOOutboundEvent(str, Enum):
 class COOOutboundEvent2(str, Enum):
     """Additional outbound events"""
     INVENTORY_COST_UPDATE = "inventory_cost_update"
+    PRODUCTION_COSTS_ACTUAL = "production_costs_actual"
+    PO_APPROVAL_NEEDED = "po_approval_needed"
 
 
 class COOInboundEvent(str, Enum):
@@ -485,4 +487,50 @@ def publish_production_complete(
             "message": f"Production run {run_number} completed: {quantity_completed} units of {product_name}"
         },
         target_module="cmo"  # Alert CMO that product is available
+    )
+
+
+def publish_production_costs(
+    run_id: int,
+    run_number: str,
+    product_name: str,
+    total_material_cost: float,
+    cost_per_unit: float,
+    quantity_completed: int
+) -> Optional[str]:
+    """Publish actual production costs to CFO."""
+    return event_bus.publish(
+        "production_costs_actual",
+        {
+            "run_id": run_id,
+            "run_number": run_number,
+            "product_name": product_name,
+            "total_material_cost": total_material_cost,
+            "cost_per_unit": cost_per_unit,
+            "quantity_completed": quantity_completed,
+            "title": f"Production Costs: {run_number}",
+            "message": f"Run {run_number}: ${total_material_cost:.2f} total, ${cost_per_unit:.2f}/unit for {quantity_completed} units"
+        },
+        target_module="cfo"
+    )
+
+
+def publish_po_approval_needed(
+    po_id: int,
+    po_number: str,
+    supplier_name: str,
+    total: float
+) -> Optional[str]:
+    """Request CEO approval for a purchase order."""
+    return event_bus.publish(
+        "po_approval_needed",
+        {
+            "po_id": po_id,
+            "po_number": po_number,
+            "supplier_name": supplier_name,
+            "total": total,
+            "title": f"PO Approval: {po_number} - ${total:,.2f}",
+            "message": f"Purchase order {po_number} for {supplier_name} totaling ${total:,.2f} needs approval"
+        },
+        target_module="ceo"
     )

@@ -53,6 +53,17 @@ class AlertSeverity(str, enum.Enum):
     CRITICAL = "critical"
 
 
+class POStatus(str, enum.Enum):
+    DRAFT = "draft"
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED = "approved"
+    SENT = "sent"
+    ACKNOWLEDGED = "acknowledged"
+    PARTIALLY_RECEIVED = "partially_received"
+    RECEIVED = "received"
+    CANCELLED = "cancelled"
+
+
 # ============================================================================
 # RAW MATERIALS
 # ============================================================================
@@ -305,6 +316,83 @@ class ShopifyAuth(Base):
     scope = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = ({'schema': COO_SCHEMA},)
+
+
+# ============================================================================
+# PURCHASE ORDERS
+# ============================================================================
+
+class PurchaseOrder(Base):
+    """Purchase orders for raw materials."""
+    __tablename__ = "purchase_orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    po_number = Column(String(50), unique=True, index=True)  # e.g., 'PO-2026-001'
+
+    supplier_id = Column(Integer, ForeignKey(f"{COO_SCHEMA}.suppliers.id"), nullable=False)
+    supplier = relationship("Supplier")
+
+    status = Column(SQLEnum(POStatus), default=POStatus.DRAFT, index=True)
+
+    # Financials
+    subtotal = Column(Float, default=0)
+    shipping_cost = Column(Float, default=0)
+    total = Column(Float, default=0)
+
+    # Dates
+    order_date = Column(DateTime)
+    expected_delivery = Column(DateTime)
+    actual_delivery = Column(DateTime)
+
+    # Approval
+    requires_approval = Column(Boolean, default=False)
+    approved_by = Column(String(100))
+    approved_at = Column(DateTime)
+    approval_notes = Column(Text)
+
+    # Source
+    source = Column(String(50), default="manual")  # 'manual', 'auto_reorder', 'production_need'
+    source_reference = Column(String(100))  # production run id, etc.
+
+    notes = Column(Text)
+    created_by = Column(String(100), default="system")
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relations
+    items = relationship("PurchaseOrderItem", back_populates="purchase_order")
+
+    __table_args__ = (
+        Index('ix_po_status', 'status'),
+        Index('ix_po_supplier', 'supplier_id'),
+        {'schema': COO_SCHEMA}
+    )
+
+
+class PurchaseOrderItem(Base):
+    """Line items in a purchase order."""
+    __tablename__ = "purchase_order_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    purchase_order_id = Column(Integer, ForeignKey(f"{COO_SCHEMA}.purchase_orders.id"), nullable=False)
+    purchase_order = relationship("PurchaseOrder", back_populates="items")
+
+    material_id = Column(Integer, ForeignKey(f"{COO_SCHEMA}.raw_materials.id"), nullable=False)
+    material = relationship("RawMaterial")
+
+    quantity = Column(Float, nullable=False)
+    unit = Column(String(50), default="yards")
+    unit_cost = Column(Float, default=0)
+    total_cost = Column(Float, default=0)
+
+    # Receiving
+    quantity_received = Column(Float, default=0)
+    received_at = Column(DateTime)
+
+    notes = Column(Text)
 
     __table_args__ = ({'schema': COO_SCHEMA},)
 

@@ -21,11 +21,12 @@ from .db import (
     RawMaterial, MaterialType, MaterialTransaction,
     Supplier, ProductionRun, ProductionStage, ProductionStageLog,
     FinishedGoodsInventory, COOAlert, AlertSeverity, COOEvent,
-    ShopifyAuth
+    ShopifyAuth, PurchaseOrder, PurchaseOrderItem, POStatus
 )
 from .event_bus import (
     event_bus, publish_inventory_low, publish_inventory_critical,
-    publish_inventory_restocked, publish_production_complete
+    publish_inventory_restocked, publish_production_complete,
+    publish_production_costs, publish_po_approval_needed
 )
 
 settings = get_settings()
@@ -171,6 +172,29 @@ class SupplierCreate(BaseModel):
     address: Optional[str] = None
     avg_lead_time_days: int = 14
     payment_terms: Optional[str] = None
+
+
+class POItemCreate(BaseModel):
+    material_id: int
+    quantity: float
+    unit_cost: float
+    notes: Optional[str] = None
+
+
+class PurchaseOrderCreate(BaseModel):
+    supplier_id: int
+    items: List[POItemCreate]
+    shipping_cost: float = 0
+    expected_delivery: Optional[datetime] = None
+    notes: Optional[str] = None
+    source: str = "manual"
+    source_reference: Optional[str] = None
+
+
+class MaterialReservation(BaseModel):
+    material_id: int
+    quantity: float
+    production_run_id: int
 
 
 # ============================================================================
@@ -985,6 +1009,757 @@ async def resolve_alert(alert_id: int, db: Session = Depends(get_db_session)):
 
 
 # ============================================================================
+# PURCHASE ORDER ENDPOINTS
+# ============================================================================
+
+PO_APPROVAL_THRESHOLD = 500.0  # POs over this amount require CEO approval
+
+
+@app.get("/coo/purchase-orders", tags=["Purchase Orders"])
+async def list_purchase_orders(
+    status: Optional[str] = None,
+    supplier_id: Optional[int] = None,
+    limit: int = Query(default=50, le=200),
+    db: Session = Depends(get_db_session)
+):
+    """List purchase orders."""
+    query = db.query(PurchaseOrder)
+
+    if status:
+        query = query.filter(PurchaseOrder.status == POStatus(status))
+    if supplier_id:
+        query = query.filter(PurchaseOrder.supplier_id == supplier_id)
+
+    pos = query.order_by(PurchaseOrder.created_at.desc()).limit(limit).all()
+
+    return [
+        {
+            "id": po.id,
+            "po_number": po.po_number,
+            "supplier_id": po.supplier_id,
+            "supplier_name": po.supplier.name if po.supplier else None,
+            "status": po.status.value if po.status else None,
+            "subtotal": po.subtotal,
+            "shipping_cost": po.shipping_cost,
+            "total": po.total,
+            "item_count": len(po.items) if po.items else 0,
+            "source": po.source,
+            "expected_delivery": po.expected_delivery.isoformat() if po.expected_delivery else None,
+            "created_at": po.created_at.isoformat() if po.created_at else None,
+        }
+        for po in pos
+    ]
+
+
+@app.post("/coo/purchase-orders", tags=["Purchase Orders"])
+async def create_purchase_order(
+    data: PurchaseOrderCreate,
+    db: Session = Depends(get_db_session)
+):
+    """Create a new purchase order."""
+    # Validate supplier
+    supplier = db.query(Supplier).filter(Supplier.id == data.supplier_id).first()
+    if not supplier:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+
+    # Generate PO number
+    year = datetime.utcnow().year
+    count = db.query(PurchaseOrder).filter(
+        PurchaseOrder.po_number.like(f"PO-{year}-%")
+    ).count()
+    po_number = f"PO-{year}-{count + 1:03d}"
+
+    # Calculate totals
+    subtotal = sum(item.quantity * item.unit_cost for item in data.items)
+    total = subtotal + data.shipping_cost
+
+    requires_approval = total > PO_APPROVAL_THRESHOLD
+
+    po = PurchaseOrder(
+        po_number=po_number,
+        supplier_id=data.supplier_id,
+        status=POStatus.PENDING_APPROVAL if requires_approval else POStatus.DRAFT,
+        subtotal=subtotal,
+        shipping_cost=data.shipping_cost,
+        total=total,
+        expected_delivery=data.expected_delivery or (
+            datetime.utcnow() + timedelta(days=supplier.avg_lead_time_days or 14)
+        ),
+        requires_approval=requires_approval,
+        source=data.source,
+        source_reference=data.source_reference,
+        notes=data.notes,
+    )
+    db.add(po)
+    db.flush()
+
+    # Add line items
+    for item_data in data.items:
+        material = db.query(RawMaterial).filter(RawMaterial.id == item_data.material_id).first()
+        if not material:
+            raise HTTPException(status_code=404, detail=f"Material {item_data.material_id} not found")
+
+        po_item = PurchaseOrderItem(
+            purchase_order_id=po.id,
+            material_id=item_data.material_id,
+            quantity=item_data.quantity,
+            unit=material.unit,
+            unit_cost=item_data.unit_cost,
+            total_cost=item_data.quantity * item_data.unit_cost,
+            notes=item_data.notes,
+        )
+        db.add(po_item)
+
+    db.commit()
+    db.refresh(po)
+
+    # If approval needed, send to CEO
+    if requires_approval:
+        publish_po_approval_needed(
+            po_id=po.id,
+            po_number=po_number,
+            supplier_name=supplier.name,
+            total=total,
+        )
+
+    return {
+        "id": po.id,
+        "po_number": po_number,
+        "status": po.status.value,
+        "total": total,
+        "requires_approval": requires_approval,
+    }
+
+
+@app.get("/coo/purchase-orders/{po_id}", tags=["Purchase Orders"])
+async def get_purchase_order(po_id: int, db: Session = Depends(get_db_session)):
+    """Get purchase order details with line items."""
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.id == po_id).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+
+    return {
+        "id": po.id,
+        "po_number": po.po_number,
+        "supplier_id": po.supplier_id,
+        "supplier_name": po.supplier.name if po.supplier else None,
+        "status": po.status.value if po.status else None,
+        "subtotal": po.subtotal,
+        "shipping_cost": po.shipping_cost,
+        "total": po.total,
+        "order_date": po.order_date.isoformat() if po.order_date else None,
+        "expected_delivery": po.expected_delivery.isoformat() if po.expected_delivery else None,
+        "actual_delivery": po.actual_delivery.isoformat() if po.actual_delivery else None,
+        "requires_approval": po.requires_approval,
+        "approved_by": po.approved_by,
+        "approved_at": po.approved_at.isoformat() if po.approved_at else None,
+        "source": po.source,
+        "notes": po.notes,
+        "items": [
+            {
+                "id": item.id,
+                "material_id": item.material_id,
+                "material_name": item.material.name if item.material else None,
+                "quantity": item.quantity,
+                "unit": item.unit,
+                "unit_cost": item.unit_cost,
+                "total_cost": item.total_cost,
+                "quantity_received": item.quantity_received,
+            }
+            for item in po.items
+        ],
+        "created_at": po.created_at.isoformat() if po.created_at else None,
+    }
+
+
+@app.post("/coo/purchase-orders/{po_id}/approve", tags=["Purchase Orders"])
+async def approve_purchase_order(
+    po_id: int,
+    approved_by: str = "ceo",
+    notes: Optional[str] = None,
+    db: Session = Depends(get_db_session)
+):
+    """Approve a purchase order."""
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.id == po_id).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+
+    if po.status != POStatus.PENDING_APPROVAL:
+        raise HTTPException(status_code=400, detail=f"Cannot approve PO with status: {po.status.value}")
+
+    po.status = POStatus.APPROVED
+    po.approved_by = approved_by
+    po.approved_at = datetime.utcnow()
+    po.approval_notes = notes
+    db.commit()
+
+    return {"success": True, "po_number": po.po_number, "status": "approved"}
+
+
+@app.post("/coo/purchase-orders/{po_id}/send", tags=["Purchase Orders"])
+async def send_purchase_order(po_id: int, db: Session = Depends(get_db_session)):
+    """Mark a purchase order as sent to supplier."""
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.id == po_id).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+
+    if po.status not in (POStatus.DRAFT, POStatus.APPROVED):
+        raise HTTPException(status_code=400, detail=f"Cannot send PO with status: {po.status.value}")
+
+    po.status = POStatus.SENT
+    po.order_date = datetime.utcnow()
+    db.commit()
+
+    return {"success": True, "po_number": po.po_number, "status": "sent"}
+
+
+@app.post("/coo/purchase-orders/{po_id}/receive", tags=["Purchase Orders"])
+async def receive_purchase_order(
+    po_id: int,
+    db: Session = Depends(get_db_session)
+):
+    """
+    Receive a purchase order - updates material inventory and records transactions.
+    Receives all items in full. For partial receiving, use the item-level endpoint.
+    """
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.id == po_id).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+
+    if po.status in (POStatus.RECEIVED, POStatus.CANCELLED):
+        raise HTTPException(status_code=400, detail=f"Cannot receive PO with status: {po.status.value}")
+
+    received_items = []
+    for item in po.items:
+        remaining = item.quantity - item.quantity_received
+        if remaining <= 0:
+            continue
+
+        # Update material inventory
+        material = db.query(RawMaterial).filter(RawMaterial.id == item.material_id).first()
+        if material:
+            old_qty = material.quantity_on_hand
+            material.quantity_on_hand += remaining
+            material.quantity_available = material.quantity_on_hand - material.quantity_reserved
+            material.is_low_stock = material.quantity_on_hand <= material.reorder_point
+            material.cost_per_unit = item.unit_cost
+            material.last_cost_update = datetime.utcnow()
+
+            # Record transaction
+            txn = MaterialTransaction(
+                material_id=item.material_id,
+                transaction_type="receive",
+                quantity=remaining,
+                unit=item.unit,
+                unit_cost=item.unit_cost,
+                total_cost=remaining * item.unit_cost,
+                reference_type="purchase_order",
+                reference_id=str(po.id),
+                notes=f"Received from PO {po.po_number}",
+            )
+            db.add(txn)
+
+            # Check restock event
+            if old_qty <= material.reorder_point and material.quantity_on_hand > material.reorder_point:
+                publish_inventory_restocked(
+                    item_type="raw_material",
+                    item_id=material.id,
+                    item_name=material.name,
+                    new_quantity=material.quantity_on_hand,
+                    sku=material.sku,
+                )
+
+        item.quantity_received = item.quantity
+        item.received_at = datetime.utcnow()
+        received_items.append(item.material_id)
+
+    po.status = POStatus.RECEIVED
+    po.actual_delivery = datetime.utcnow()
+    db.commit()
+
+    return {
+        "success": True,
+        "po_number": po.po_number,
+        "status": "received",
+        "items_received": len(received_items),
+    }
+
+
+@app.post("/coo/purchase-orders/{po_id}/cancel", tags=["Purchase Orders"])
+async def cancel_purchase_order(po_id: int, db: Session = Depends(get_db_session)):
+    """Cancel a purchase order."""
+    po = db.query(PurchaseOrder).filter(PurchaseOrder.id == po_id).first()
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+
+    if po.status in (POStatus.RECEIVED, POStatus.CANCELLED):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel PO with status: {po.status.value}")
+
+    po.status = POStatus.CANCELLED
+    db.commit()
+
+    return {"success": True, "po_number": po.po_number, "status": "cancelled"}
+
+
+# ============================================================================
+# REORDER AUTOMATION ENDPOINTS
+# ============================================================================
+
+@app.get("/coo/reorder-suggestions", tags=["Reorder"])
+async def get_reorder_suggestions(db: Session = Depends(get_db_session)):
+    """
+    Get materials that need reordering based on reorder points.
+    Calculates dynamic reorder points from recent usage velocity.
+    """
+    low_materials = db.query(RawMaterial).filter(
+        RawMaterial.is_active == True,
+        RawMaterial.is_low_stock == True,
+    ).all()
+
+    suggestions = []
+    for m in low_materials:
+        # Calculate usage velocity from last 30 days of 'use' transactions
+        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        usage_txns = db.query(MaterialTransaction).filter(
+            MaterialTransaction.material_id == m.id,
+            MaterialTransaction.transaction_type == "use",
+            MaterialTransaction.created_at >= thirty_days_ago,
+        ).all()
+
+        total_used = sum(abs(t.quantity) for t in usage_txns)
+        daily_velocity = total_used / 30 if total_used > 0 else 0
+
+        # Days of stock remaining
+        days_remaining = m.quantity_on_hand / daily_velocity if daily_velocity > 0 else float('inf')
+
+        # Supplier lead time
+        supplier = db.query(Supplier).filter(Supplier.id == m.supplier_id).first() if m.supplier_id else None
+        lead_time = supplier.avg_lead_time_days if supplier else 14
+
+        # Urgency
+        if days_remaining <= lead_time:
+            urgency = "critical"
+        elif days_remaining <= lead_time * 1.5:
+            urgency = "high"
+        else:
+            urgency = "normal"
+
+        suggestions.append({
+            "material_id": m.id,
+            "sku": m.sku,
+            "name": m.name,
+            "quantity_on_hand": m.quantity_on_hand,
+            "reorder_point": m.reorder_point,
+            "reorder_quantity": m.reorder_quantity,
+            "daily_velocity": round(daily_velocity, 2),
+            "days_remaining": round(days_remaining, 1) if days_remaining != float('inf') else None,
+            "supplier_id": m.supplier_id,
+            "supplier_name": supplier.name if supplier else None,
+            "lead_time_days": lead_time,
+            "urgency": urgency,
+            "estimated_cost": round(m.reorder_quantity * m.cost_per_unit, 2),
+        })
+
+    # Sort by urgency
+    urgency_order = {"critical": 0, "high": 1, "normal": 2}
+    suggestions.sort(key=lambda x: urgency_order.get(x["urgency"], 3))
+
+    return {"suggestions": suggestions, "total": len(suggestions)}
+
+
+@app.post("/coo/reorder-suggestions/generate-pos", tags=["Reorder"])
+async def auto_generate_purchase_orders(
+    urgency_filter: Optional[str] = Query(None, description="Filter: critical, high, normal"),
+    db: Session = Depends(get_db_session)
+):
+    """
+    Auto-generate draft purchase orders from reorder suggestions.
+    Groups items by supplier into single POs.
+    """
+    low_materials = db.query(RawMaterial).filter(
+        RawMaterial.is_active == True,
+        RawMaterial.is_low_stock == True,
+        RawMaterial.supplier_id != None,
+    ).all()
+
+    if not low_materials:
+        return {"success": True, "message": "No materials need reordering", "pos_created": 0}
+
+    # Group by supplier
+    by_supplier = {}
+    for m in low_materials:
+        if m.supplier_id not in by_supplier:
+            by_supplier[m.supplier_id] = []
+        by_supplier[m.supplier_id].append(m)
+
+    created_pos = []
+    year = datetime.utcnow().year
+
+    for supplier_id, materials in by_supplier.items():
+        supplier = db.query(Supplier).filter(Supplier.id == supplier_id).first()
+        if not supplier:
+            continue
+
+        count = db.query(PurchaseOrder).filter(
+            PurchaseOrder.po_number.like(f"PO-{year}-%")
+        ).count()
+        po_number = f"PO-{year}-{count + 1:03d}"
+
+        subtotal = sum(m.reorder_quantity * m.cost_per_unit for m in materials)
+        total = subtotal
+        requires_approval = total > PO_APPROVAL_THRESHOLD
+
+        po = PurchaseOrder(
+            po_number=po_number,
+            supplier_id=supplier_id,
+            status=POStatus.PENDING_APPROVAL if requires_approval else POStatus.DRAFT,
+            subtotal=subtotal,
+            total=total,
+            expected_delivery=datetime.utcnow() + timedelta(days=supplier.avg_lead_time_days or 14),
+            requires_approval=requires_approval,
+            source="auto_reorder",
+            notes=f"Auto-generated from reorder suggestions for {len(materials)} materials",
+        )
+        db.add(po)
+        db.flush()
+
+        for m in materials:
+            po_item = PurchaseOrderItem(
+                purchase_order_id=po.id,
+                material_id=m.id,
+                quantity=m.reorder_quantity,
+                unit=m.unit,
+                unit_cost=m.cost_per_unit,
+                total_cost=m.reorder_quantity * m.cost_per_unit,
+            )
+            db.add(po_item)
+
+        if requires_approval:
+            publish_po_approval_needed(
+                po_id=po.id,
+                po_number=po_number,
+                supplier_name=supplier.name,
+                total=total,
+            )
+
+        created_pos.append({
+            "po_number": po_number,
+            "supplier": supplier.name,
+            "items": len(materials),
+            "total": total,
+            "requires_approval": requires_approval,
+        })
+
+    db.commit()
+
+    return {
+        "success": True,
+        "pos_created": len(created_pos),
+        "purchase_orders": created_pos,
+    }
+
+
+@app.post("/coo/materials/{material_id}/set-reorder", tags=["Reorder"])
+async def set_reorder_params(
+    material_id: int,
+    reorder_point: float,
+    reorder_quantity: float,
+    db: Session = Depends(get_db_session)
+):
+    """Set reorder point and quantity for a material."""
+    material = db.query(RawMaterial).filter(RawMaterial.id == material_id).first()
+    if not material:
+        raise HTTPException(status_code=404, detail="Material not found")
+
+    material.reorder_point = reorder_point
+    material.reorder_quantity = reorder_quantity
+    material.is_low_stock = material.quantity_on_hand <= reorder_point
+    db.commit()
+
+    return {
+        "success": True,
+        "material_id": material_id,
+        "reorder_point": reorder_point,
+        "reorder_quantity": reorder_quantity,
+        "is_low_stock": material.is_low_stock,
+    }
+
+
+# ============================================================================
+# PRODUCTION COST TRACKING ENDPOINTS
+# ============================================================================
+
+@app.get("/coo/production/{run_id}/costs", tags=["Production Costs"])
+async def get_production_costs(run_id: int, db: Session = Depends(get_db_session)):
+    """
+    Get cost breakdown for a production run.
+    Calculates material costs from transactions linked to this run.
+    """
+    run = db.query(ProductionRun).filter(ProductionRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Production run not found")
+
+    # Get all material transactions for this run
+    txns = db.query(MaterialTransaction).filter(
+        MaterialTransaction.reference_type == "production_run",
+        MaterialTransaction.reference_id == str(run_id),
+    ).all()
+
+    material_costs = []
+    total_material_cost = 0
+    for txn in txns:
+        material = db.query(RawMaterial).filter(RawMaterial.id == txn.material_id).first()
+        cost = abs(txn.total_cost or 0)
+        total_material_cost += cost
+        material_costs.append({
+            "material_id": txn.material_id,
+            "material_name": material.name if material else "Unknown",
+            "sku": material.sku if material else None,
+            "quantity_used": abs(txn.quantity),
+            "unit": txn.unit,
+            "unit_cost": txn.unit_cost,
+            "total_cost": cost,
+        })
+
+    # Planned cost from materials_allocated
+    planned_cost = 0
+    if run.materials_allocated:
+        for alloc in run.materials_allocated:
+            mat = db.query(RawMaterial).filter(RawMaterial.id == alloc.get("material_id")).first()
+            if mat:
+                planned_cost += alloc.get("quantity", 0) * (mat.cost_per_unit or 0)
+
+    qty = run.quantity_completed or run.quantity_planned
+    cost_per_unit = total_material_cost / qty if qty > 0 else 0
+
+    return {
+        "run_id": run.id,
+        "run_number": run.run_number,
+        "product_name": run.product_name,
+        "status": run.status,
+        "quantity_planned": run.quantity_planned,
+        "quantity_completed": run.quantity_completed,
+        "material_costs": material_costs,
+        "total_material_cost": round(total_material_cost, 2),
+        "planned_material_cost": round(planned_cost, 2),
+        "cost_variance": round(total_material_cost - planned_cost, 2) if planned_cost else None,
+        "cost_per_unit": round(cost_per_unit, 2),
+    }
+
+
+@app.post("/coo/production/{run_id}/publish-costs", tags=["Production Costs"])
+async def publish_run_costs(run_id: int, db: Session = Depends(get_db_session)):
+    """Publish actual production costs to CFO module."""
+    run = db.query(ProductionRun).filter(ProductionRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Production run not found")
+
+    txns = db.query(MaterialTransaction).filter(
+        MaterialTransaction.reference_type == "production_run",
+        MaterialTransaction.reference_id == str(run_id),
+    ).all()
+
+    total_material_cost = sum(abs(t.total_cost or 0) for t in txns)
+    qty = run.quantity_completed or run.quantity_planned
+    cost_per_unit = total_material_cost / qty if qty > 0 else 0
+
+    publish_production_costs(
+        run_id=run.id,
+        run_number=run.run_number,
+        product_name=run.product_name,
+        total_material_cost=total_material_cost,
+        cost_per_unit=cost_per_unit,
+        quantity_completed=qty,
+    )
+
+    return {
+        "success": True,
+        "run_number": run.run_number,
+        "total_material_cost": round(total_material_cost, 2),
+        "cost_per_unit": round(cost_per_unit, 2),
+        "published_to": "cfo",
+    }
+
+
+# ============================================================================
+# MATERIAL RESERVATION ENDPOINTS
+# ============================================================================
+
+@app.post("/coo/materials/reserve", tags=["Material Reservation"])
+async def reserve_materials(
+    reservations: List[MaterialReservation],
+    db: Session = Depends(get_db_session)
+):
+    """
+    Reserve materials for a production run.
+    Checks availability and prevents over-allocation.
+    """
+    reserved_items = []
+
+    for res in reservations:
+        material = db.query(RawMaterial).filter(RawMaterial.id == res.material_id).first()
+        if not material:
+            raise HTTPException(status_code=404, detail=f"Material {res.material_id} not found")
+
+        if material.quantity_available < res.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient {material.name}: {material.quantity_available} available, {res.quantity} requested"
+            )
+
+        material.quantity_reserved += res.quantity
+        material.quantity_available = material.quantity_on_hand - material.quantity_reserved
+
+        # Record transaction
+        txn = MaterialTransaction(
+            material_id=res.material_id,
+            transaction_type="reserve",
+            quantity=-res.quantity,
+            unit=material.unit,
+            unit_cost=material.cost_per_unit,
+            total_cost=res.quantity * (material.cost_per_unit or 0),
+            reference_type="production_run",
+            reference_id=str(res.production_run_id),
+            notes=f"Reserved for production run {res.production_run_id}",
+        )
+        db.add(txn)
+
+        reserved_items.append({
+            "material_id": material.id,
+            "name": material.name,
+            "quantity_reserved": res.quantity,
+            "remaining_available": material.quantity_available,
+        })
+
+    # Update production run materials_allocated
+    if reservations:
+        run = db.query(ProductionRun).filter(
+            ProductionRun.id == reservations[0].production_run_id
+        ).first()
+        if run:
+            existing = run.materials_allocated or []
+            for res in reservations:
+                existing.append({"material_id": res.material_id, "quantity": res.quantity})
+            run.materials_allocated = existing
+
+    db.commit()
+
+    return {"success": True, "reserved": reserved_items}
+
+
+@app.post("/coo/materials/release", tags=["Material Reservation"])
+async def release_materials(
+    material_id: int,
+    quantity: float,
+    production_run_id: int,
+    db: Session = Depends(get_db_session)
+):
+    """Release reserved materials back to available inventory."""
+    material = db.query(RawMaterial).filter(RawMaterial.id == material_id).first()
+    if not material:
+        raise HTTPException(status_code=404, detail="Material not found")
+
+    release_qty = min(quantity, material.quantity_reserved)
+    material.quantity_reserved -= release_qty
+    material.quantity_available = material.quantity_on_hand - material.quantity_reserved
+
+    txn = MaterialTransaction(
+        material_id=material_id,
+        transaction_type="release",
+        quantity=release_qty,
+        unit=material.unit,
+        reference_type="production_run",
+        reference_id=str(production_run_id),
+        notes=f"Released from production run {production_run_id}",
+    )
+    db.add(txn)
+    db.commit()
+
+    return {
+        "success": True,
+        "material_id": material_id,
+        "quantity_released": release_qty,
+        "quantity_reserved": material.quantity_reserved,
+        "quantity_available": material.quantity_available,
+    }
+
+
+@app.post("/coo/production/{run_id}/use-materials", tags=["Material Reservation"])
+async def use_reserved_materials(
+    run_id: int,
+    db: Session = Depends(get_db_session)
+):
+    """
+    Convert reserved materials to used for a production run.
+    Decreases on_hand and reserved, records 'use' transactions for cost tracking.
+    """
+    run = db.query(ProductionRun).filter(ProductionRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Production run not found")
+
+    if not run.materials_allocated:
+        raise HTTPException(status_code=400, detail="No materials allocated to this run")
+
+    used_items = []
+    for alloc in run.materials_allocated:
+        mat_id = alloc.get("material_id")
+        qty = alloc.get("quantity", 0)
+        if not mat_id or qty <= 0:
+            continue
+
+        material = db.query(RawMaterial).filter(RawMaterial.id == mat_id).first()
+        if not material:
+            continue
+
+        # Move from reserved to used
+        actual_reserve = min(qty, material.quantity_reserved)
+        material.quantity_reserved -= actual_reserve
+        material.quantity_on_hand -= qty
+        material.quantity_available = material.quantity_on_hand - material.quantity_reserved
+        material.is_low_stock = material.quantity_on_hand <= material.reorder_point
+
+        txn = MaterialTransaction(
+            material_id=mat_id,
+            transaction_type="use",
+            quantity=-qty,
+            unit=material.unit,
+            unit_cost=material.cost_per_unit,
+            total_cost=qty * (material.cost_per_unit or 0),
+            reference_type="production_run",
+            reference_id=str(run_id),
+            notes=f"Used in production run {run.run_number}",
+        )
+        db.add(txn)
+
+        # Check low stock
+        if material.is_low_stock:
+            publish_inventory_low(
+                item_type="raw_material",
+                item_id=material.id,
+                item_name=material.name,
+                current_quantity=material.quantity_on_hand,
+                reorder_point=material.reorder_point,
+                sku=material.sku,
+            )
+
+        used_items.append({
+            "material_id": mat_id,
+            "name": material.name,
+            "quantity_used": qty,
+            "cost": round(qty * (material.cost_per_unit or 0), 2),
+        })
+
+    db.commit()
+
+    return {
+        "success": True,
+        "run_number": run.run_number,
+        "materials_used": used_items,
+        "total_cost": round(sum(i["cost"] for i in used_items), 2),
+    }
+
+
+# ============================================================================
 # EVENTS ENDPOINTS
 # ============================================================================
 
@@ -1135,6 +1910,14 @@ async def dashboard_summary(db: Session = Depends(get_db_session)):
     # Unresolved alerts
     unresolved_alerts = db.query(COOAlert).filter(COOAlert.is_resolved == False).count()
 
+    # Purchase order stats
+    pending_pos = db.query(PurchaseOrder).filter(
+        PurchaseOrder.status.in_([POStatus.DRAFT, POStatus.PENDING_APPROVAL, POStatus.APPROVED, POStatus.SENT])
+    ).count()
+    awaiting_approval = db.query(PurchaseOrder).filter(
+        PurchaseOrder.status == POStatus.PENDING_APPROVAL
+    ).count()
+
     return {
         "timestamp": datetime.utcnow().isoformat(),
         "raw_materials": {
@@ -1148,6 +1931,10 @@ async def dashboard_summary(db: Session = Depends(get_db_session)):
         "finished_goods": {
             "total_skus": total_finished,
             "low_stock": low_stock_finished
+        },
+        "purchase_orders": {
+            "open": pending_pos,
+            "awaiting_approval": awaiting_approval
         },
         "alerts": {
             "unresolved": unresolved_alerts
@@ -1165,12 +1952,14 @@ async def root():
     return {
         "module": "Dearborn AI COO",
         "description": "Operations module for inventory and production management",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
             "materials": "/coo/materials",
             "production": "/coo/production",
             "finished_goods": "/coo/finished-goods",
             "suppliers": "/coo/suppliers",
+            "purchase_orders": "/coo/purchase-orders",
+            "reorder": "/coo/reorder-suggestions",
             "alerts": "/coo/alerts",
             "dashboard": "/coo/dashboard"
         }
