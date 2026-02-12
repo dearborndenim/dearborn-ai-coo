@@ -44,6 +44,8 @@ class COOInboundEvent(str, Enum):
     PRIORITY_CHANGED = "priority_changed"
     BUDGET_ALLOCATED = "budget_allocated"
     CAPACITY_CHECK_REQUEST = "capacity_check_request"
+    TECH_PACK_READY = "tech_pack_ready"
+    PRODUCT_APPROVED_FOR_PRODUCTION = "product_approved_for_production"
 
 
 class EventBus:
@@ -212,6 +214,10 @@ class EventBus:
                 self._handle_budget_allocated(payload)
             elif event_type == COOInboundEvent.CAPACITY_CHECK_REQUEST.value:
                 self._handle_capacity_check_request(payload)
+            elif event_type == COOInboundEvent.TECH_PACK_READY.value:
+                self._handle_tech_pack_ready(payload)
+            elif event_type == COOInboundEvent.PRODUCT_APPROVED_FOR_PRODUCTION.value:
+                self._handle_product_approved_for_production(payload)
             else:
                 print(f"Unknown event type: {event_type}")
         except Exception as e:
@@ -357,6 +363,151 @@ class EventBus:
             db.commit()
         except Exception as e:
             print(f"Error handling capacity check: {e}")
+        finally:
+            db.close()
+
+    def _handle_tech_pack_ready(self, payload: Dict[str, Any]):
+        """Handle tech pack ready from CDO - create sourcing alert and draft POs from BOM."""
+        tech_pack_id = payload.get("tech_pack_id")
+        tech_pack_number = payload.get("tech_pack_number", "Unknown")
+        bom = payload.get("bom", [])
+
+        db = SessionLocal()
+        try:
+            # Create alert for operations team
+            alert = COOAlert(
+                severity=AlertSeverity.WARNING,
+                category="sourcing",
+                title=f"Sourcing Needed: {tech_pack_number}",
+                message=f"Tech pack {tech_pack_number} is ready. {len(bom)} materials need sourcing."
+            )
+            db.add(alert)
+
+            # Auto-create draft POs from BOM if materials are provided
+            if bom:
+                from .db import PurchaseOrder, PurchaseOrderItem, Supplier, RawMaterial
+                estimated_units = payload.get("estimated_units", 500)
+                waste_factor = 1.05  # 5% waste
+
+                # Find a default supplier or use first available
+                supplier = db.query(Supplier).first()
+                if supplier:
+                    # Create one PO for all materials from this tech pack
+                    total_po_cost = 0
+                    bom_details = []
+
+                    for item in bom:
+                        material_name = item.get("material", "Unknown material")
+                        quantity_per_unit = item.get("quantity", 0)
+                        unit_cost = item.get("unit_cost", 0)
+                        total_qty = quantity_per_unit * estimated_units * waste_factor
+                        item_total = total_qty * unit_cost
+                        total_po_cost += item_total
+
+                        bom_details.append(
+                            f"- {material_name}: {total_qty:.2f} units @ ${unit_cost:.2f}/unit = ${item_total:.2f}"
+                        )
+
+                    po = PurchaseOrder(
+                        supplier_id=supplier.id,
+                        status="draft",
+                        notes=f"Auto-generated from tech pack {tech_pack_number}\nBOM:\n" + "\n".join(bom_details),
+                        total=round(total_po_cost, 2),
+                    )
+                    db.add(po)
+                    db.flush()
+
+                    # Try to create PO items for materials that exist in the system
+                    for item in bom:
+                        material_name = item.get("material", "Unknown material")
+                        quantity_per_unit = item.get("quantity", 0)
+                        unit_cost = item.get("unit_cost", 0)
+                        total_qty = quantity_per_unit * estimated_units * waste_factor
+
+                        # Try to find existing material by name
+                        material = db.query(RawMaterial).filter(
+                            RawMaterial.name.ilike(f"%{material_name}%")
+                        ).first()
+
+                        if material:
+                            po_item = PurchaseOrderItem(
+                                purchase_order_id=po.id,
+                                material_id=material.id,
+                                quantity=round(total_qty, 2),
+                                unit_cost=unit_cost,
+                                total_cost=round(total_qty * unit_cost, 2),
+                            )
+                            db.add(po_item)
+
+                # Publish sourcing cost estimate to CFO
+                total_material_cost = sum(
+                    (item.get("quantity", 0) * estimated_units * waste_factor * item.get("unit_cost", 0))
+                    for item in bom
+                )
+                self.publish(
+                    "sourcing_cost_estimate",
+                    {
+                        "tech_pack_id": tech_pack_id,
+                        "tech_pack_number": tech_pack_number,
+                        "estimated_units": estimated_units,
+                        "total_material_cost": round(total_material_cost, 2),
+                        "bom_items": len(bom),
+                        "title": f"Sourcing Cost: {tech_pack_number}",
+                        "message": f"Estimated material cost: ${total_material_cost:,.2f} for {estimated_units} units",
+                    },
+                    target_module="cfo"
+                )
+
+            db.commit()
+        except Exception as e:
+            print(f"Error handling tech_pack_ready: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
+    def _handle_product_approved_for_production(self, payload: Dict[str, Any]):
+        """Handle product approved for production from CDO - submit draft POs."""
+        pipeline_number = payload.get("pipeline_number", "Unknown")
+        tech_pack_id = payload.get("tech_pack_id")
+
+        db = SessionLocal()
+        try:
+            # Find draft POs associated with this tech pack
+            from .db import PurchaseOrder
+            draft_pos = []
+            if tech_pack_id:
+                draft_pos = db.query(PurchaseOrder).filter(
+                    PurchaseOrder.status == "draft",
+                    PurchaseOrder.notes.contains(str(tech_pack_id))
+                ).all()
+
+            submitted_count = 0
+            for po in draft_pos:
+                po.status = "pending_approval"
+                submitted_count += 1
+
+            # Create production run entry
+            from .db import ProductionRun
+            run = ProductionRun(
+                product_name=payload.get("title", f"Pipeline {pipeline_number}"),
+                status="planned",
+                quantity_planned=payload.get("estimated_units", 500),
+                notes=f"Auto-created from pipeline {pipeline_number}",
+            )
+            db.add(run)
+
+            alert = COOAlert(
+                severity=AlertSeverity.INFO,
+                category="production",
+                title=f"Production Approved: {pipeline_number}",
+                message=f"Product from pipeline {pipeline_number} approved. {submitted_count} POs submitted, production run created."
+            )
+            db.add(alert)
+
+            db.commit()
+        except Exception as e:
+            print(f"Error handling product_approved_for_production: {e}")
+            db.rollback()
         finally:
             db.close()
 
